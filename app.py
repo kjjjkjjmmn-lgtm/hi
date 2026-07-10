@@ -1,134 +1,117 @@
-from flask import Flask, request, jsonify
-import jwt
-import requests
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-import RemoveFriend_Req_pb2
-from byte import Encrypt_ID, encrypt_api
-import binascii
-import data_pb2
-import uid_generator_pb2
-import my_pb2
-import output_pb2
-from datetime import datetime
-import json
-import time
-import urllib3
-import warnings
+import requests, os, psutil, sys, jwt, pickle, json, binascii, time, urllib3, base64, datetime, re, socket, threading
 import asyncio
-import sys
+import random
+from protobuf_decoder.protobuf_decoder import Parser
+from bote import *
+from bote import xSendTeamMsg
+from bote import Auth_Chat
+from xHeaders import *
+from datetime import datetime
+from google.protobuf.timestamp_pb2 import Timestamp
+from concurrent.futures import ThreadPoolExecutor
+from threading import Thread
+from flask import Flask, request, jsonify
+import tempfile
+from Pb2 import MajoRLoGinrEq_pb2
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 
-# -----------------------------
-# Security Warnings Disable
-# -----------------------------
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings("ignore", category=UserWarning, message="Unverified HTTPS request")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  
 
 app = Flask(__name__)
 
-# -----------------------------
-# AES Configuration
-# -----------------------------
+# ================== مفاتيح التشفير ==================
 AES_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 AES_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
 
-def encrypt_message(data_bytes):
+connected_clients = {}
+connected_clients_lock = threading.Lock()
+
+# ================== دوال التشفير ==================
+def encAEs(hexStr):
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
-    return cipher.encrypt(pad(data_bytes, AES.block_size))
+    return cipher.encrypt(pad(bytes.fromhex(hexStr), AES.block_size)).hex()
 
-def encrypt_message_hex(data_bytes):
+def decAEs(hexStr):
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
-    encrypted = cipher.encrypt(pad(data_bytes, AES.block_size))
-    return binascii.hexlify(encrypted).decode('utf-8')
+    return unpad(cipher.decrypt(bytes.fromhex(hexStr)), AES.block_size).hex()
 
-# -----------------------------
-# Region-based URL Configuration
-# -----------------------------
-def get_base_url(server_name):
-    server_name = server_name.upper()
-    if server_name == "IND":
-        return "https://client.ind.freefiremobile.com/"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        return "https://client.us.freefiremobile.com/"
-    else:
-        return "https://clientbp.ggpolarbear.com/"
+def encPacket(hexStr, k, iv):
+    return AES.new(k, AES.MODE_CBC, iv).encrypt(pad(bytes.fromhex(hexStr), 16)).hex()
 
-def get_server_from_token(token):
-    """Extract server region from JWT token"""
-    try:
-        decoded = jwt.decode(token, options={"verify_signature": False})
-        lock_region = decoded.get("lock_region", "IND")
-        return lock_region.upper()
-    except:
-        return "IND"
+def decPacket(hexStr, k, iv):
+    return unpad(AES.new(k, AES.MODE_CBC, iv).decrypt(bytes.fromhex(hexStr)), 16).hex()
 
-# -----------------------------
-# Retry Decorator - 10 baar try karega
-# -----------------------------
-def retry_operation(max_retries=10, delay=1):
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(max_retries):
-                try:
-                    result = func(*args, **kwargs)
-                    if result and result.get('status') in ['success', 'failed']:
-                        return result
-                    print(f"Attempt {attempt + 1}/{max_retries} failed, retrying...")
-                except Exception as e:
-                    last_exception = e
-                    print(f"Attempt {attempt + 1}/{max_retries} failed with error: {str(e)}")
-                
-                if attempt < max_retries - 1:
-                    time.sleep(delay)
-            
-            if last_exception:
-                return {
-                    "status": "error",
-                    "message": f"All {max_retries} attempts failed",
-                    "error": str(last_exception)
-                }
-            return {
-                "status": "error", 
-                "message": f"All {max_retries} attempts failed"
-            }
-        return wrapper
-    return decorator
-
-# ================== بناء البايلود باستخدام Pb2 ==================
+# ================== دوال بناء البايلود ==================
 def build_major_login_payload(open_id, access_token, platform_id=2):
     """بناء بايلود MajorLogin باستخدام Protobuf من Pb2"""
-    major_login = my_pb2.GameData()
+    major_login = MajoRLoGinrEq_pb2.MajorLogin()
     
     # تعبئة الحقول
-    major_login.timestamp = str(datetime.now())[:-7]
+    major_login.event_time = str(datetime.now())[:-7]
     major_login.game_name = "free fire"
-    major_login.game_version = 1
-    major_login.version_code = "1.126.1"
-    major_login.os_info = "Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)"
-    major_login.device_type = "Handheld"
-    major_login.network_provider = "Verizon Wireless"
-    major_login.connection_type = "WIFI"
-    major_login.screen_width = 1280
-    major_login.screen_height = 960
-    major_login.dpi = "240"
-    major_login.cpu_info = "ARMv7 VFPv3 NEON VMH | 2400 | 4"
-    major_login.total_ram = 5951
-    major_login.gpu_name = "Adreno (TM) 640"
-    major_login.gpu_version = "OpenGL ES 3.0"
-    major_login.user_id = "Google|74b585a9-0268-4ad3-8f36-ef41d2e53610"
-    major_login.ip_address = "172.190.111.97"
+    major_login.platform_id = platform_id
+    major_login.client_version = "1.126.1"
+    major_login.system_software = "Android OS 9 / API-28 (PQ3B.190801.10101846/G9650ZHU2ARC6)"
+    major_login.system_hardware = "Handheld"
+    major_login.telecom_operator = "Verizon"
+    major_login.network_type = "WIFI"
+    major_login.screen_width = 1920
+    major_login.screen_height = 1080
+    major_login.screen_dpi = "280"
+    major_login.processor_details = "ARM64 FP ASIMD AES VMH | 2865 | 4"
+    major_login.memory = 3003
+    major_login.gpu_renderer = "Adreno (TM) 640"
+    major_login.gpu_version = "OpenGL ES 3.1 v1.46"
+    major_login.unique_device_id = "Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57"
+    major_login.client_ip = "223.191.51.89"
     major_login.language = "en"
     major_login.open_id = open_id
+    major_login.open_id_type = "4"
+    major_login.device_type = "Handheld"
+    
+    memory_available = major_login.memory_available
+    memory_available.version = 55
+    memory_available.hidden_value = 81
+    
     major_login.access_token = access_token
-    major_login.platform_type = platform_id
-    major_login.field_99 = str(platform_id)
-    major_login.field_100 = str(platform_id)
+    major_login.platform_sdk_id = 1
+    major_login.network_operator_a = "Verizon"
+    major_login.network_type_a = "WIFI"
+    major_login.client_using_version = "7428b253defc164018c604a1ebbfebdf"
+    major_login.external_storage_total = 36235
+    major_login.external_storage_available = 31335
+    major_login.internal_storage_total = 2519
+    major_login.internal_storage_available = 703
+    major_login.game_disk_storage_available = 25010
+    major_login.game_disk_storage_total = 26628
+    major_login.external_sdcard_avail_storage = 32992
+    major_login.external_sdcard_total_storage = 36235
+    major_login.login_by = 3
+    major_login.library_path = "/data/app/com.dts.freefireth-YPKM8jHEwAJlhpmhDhv5MQ==/lib/arm64"
+    major_login.reg_avatar = 1
+    major_login.library_token = "5b892aaabd688e571f688053118a162b|/data/app/com.dts.freefireth-YPKM8jHEwAJlhpmhDhv5MQ==/base.apk"
+    major_login.channel_type = 3
+    major_login.cpu_type = 2
+    major_login.cpu_architecture = "64"
+    major_login.client_version_code = "2019116753"
+    major_login.graphics_api = "OpenGLES2"
+    major_login.supported_astc_bitset = 16383
+    major_login.login_open_id_type = 4
+    major_login.analytics_detail = b"FwQVTgUPX1UaUllDDwcWCRBpWAUOUgsvA1snWlBaO1kFYg=="
+    major_login.loading_time = 13564
+    major_login.release_channel = "android"
+    major_login.extra_info = "KqsHTymw5/5GB23YGniUYN2/q47GATrq7eFeRatf0NkwLKEMQ0PK5BKEk72dPflAxUlEBir6Vtey83XqF593qsl8hwY="
+    major_login.android_engine_init_flag = 110009
+    major_login.if_push = 1
+    major_login.is_vpn = 1
+    major_login.origin_platform_type = "4"
+    major_login.primary_platform_type = "4"
     
     # Serialize إلى bytes
     protobuf_raw = major_login.SerializeToString()
     
-    # طباعة Protobuf RAW (اختياري - للإيضاح)
+    # ✅ طباعة Protobuf RAW
     print(f"\n📦 Protobuf RAW (Hex):")
     print(protobuf_raw.hex())
     print("="*60)
@@ -138,448 +121,699 @@ def build_major_login_payload(open_id, access_token, platform_id=2):
     padded = pad(protobuf_raw, AES.block_size)
     encrypted = cipher.encrypt(padded)
     
-    # طباعة Encrypted Payload (اختياري - للإيضاح)
+    # ✅ طباعة Encrypted Payload
     print(f"\n🔐 Encrypted Payload (Hex):")
     print(encrypted.hex())
     print("="*60)
     
     return encrypted, protobuf_raw.hex()
 
-# -----------------------------
-# JWT Token Generation Functions - (معدل لاستخدام Pb2)
-# -----------------------------
-def get_token_from_uid_password(uid, password):
-    """Get JWT token using UID and password - باستخدام Pb2"""
+def generate_random_color():
+    color_list = [
+        "[00FF00][b][c]", "[FFDD00][b][c]", "[3813F3][b][c]", "[FF0000][b][c]",
+        "[0000FF][b][c]", "[FFA500][b][c]", "[DF07F8][b][c]", "[11EAFD][b][c]",
+        "[DCE775][b][c]", "[A8E6CF][b][c]", "[7CB342][b][c]", "[FFB300][b][c]",
+        "[90EE90][b][c]", "[FF4500][b][c]", "[FFD700][b][c]", "[32CD32][b][c]",
+        "[87CEEB][b][c]", "[9370DB][b][c]", "[FF69B4][b][c]", "[8A2BE2][b][c]",
+        "[00BFFF][b][c]", "[1E90FF][b][c]", "[20B2AA][b][c]", "[00FA9A][b][c]",
+        "[008000][b][c]", "[FFFF00][b][c]", "[FF8C00][b][c]", "[DC143C][b][c]"
+    ]
+    return random.choice(color_list)
+
+def get_random_accounts(count=1):
+    with connected_clients_lock:
+        if not connected_clients:
+            return []
+        available_clients = list(connected_clients.values())
+        if count >= len(available_clients):
+            return available_clients
+        return random.sample(available_clients, count)
+
+def AuTo_ResTartinG():
+    time.sleep(6 * 60 * 60)
+    print('\n🔄 - AuTo ResTartinG The BoT ... ! ')
+    p = psutil.Process(os.getpid())
+    for handler in p.open_files():
+        try:
+            os.close(handler.fd)
+        except Exception as e:
+            print(f"❌ - Error CLose Files : {e}")
+    for conn in p.net_connections():
+        try:
+            if hasattr(conn, 'fd'):
+                os.close(conn.fd)
+        except Exception as e:
+            print(f"❌ - Error CLose Connection : {e}")
+    sys.path.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+       
+def ResTarT_BoT():
+    print('\n🔄 - ResTartinG The BoT ... ! ')
+    p = psutil.Process(os.getpid())
+    open_files = p.open_files()
+    connections = p.net_connections()
+    for handler in open_files:
+        try:
+            os.close(handler.fd)
+        except Exception:
+            pass           
+    for conn in connections:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    sys.path.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
+def execute_blrx_command(client, teamcode, name, user_id, client_number):
+    success = False
     try:
-        oauth_url = "https://100067.connect.garena.com/oauth/guest/token/grant"
-        payload = {
-            'uid': uid,
-            'password': password,
-            'response_type': "token",
-            'client_type': "2",
-            'client_secret': "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
-            'client_id': "100067"
-        }
-        
-        headers = {
-            'User-Agent': "GarenaMSDK/4.0.19P9(SM-M526B ;Android 13;pt;BR;)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip"
-        }
-
-        oauth_response = requests.post(oauth_url, data=payload, headers=headers, timeout=10, verify=False)
-        oauth_response.raise_for_status()
-        
-        oauth_data = oauth_response.json()
-        
-        if 'access_token' not in oauth_data:
-            return None, "OAuth response missing access_token"
-
-        access_token = oauth_data['access_token']
-        open_id = oauth_data.get('open_id', '')
-        
-        print(f"\n✅ Open ID: {open_id}")
-        print(f"✅ Access Token: {access_token[:30]}...")
-        
-        # Try platforms with the obtained credentials
-        platforms = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-        
-        for platform_type in platforms:
-            result = try_platform_login(open_id, access_token, platform_type)
-            if result and 'token' in result:
-                return result['token'], None
-        
-        return None, "Login successful but JWT generation failed on all platforms"
-
-    except requests.RequestException as e:
-        return None, f"OAuth request failed: {str(e)}"
-    except ValueError:
-        return None, "Invalid JSON response from OAuth service"
-    except Exception as e:
-        return None, f"Unexpected error: {str(e)}"
-
-def try_platform_login(open_id, access_token, platform_type):
-    """Try login for a specific platform - باستخدام Pb2"""
-    try:
-        # ✅ بناء البايلود باستخدام الدالة الجديدة
-        encrypted_payload, protobuf_raw = build_major_login_payload(open_id, access_token, platform_type)
-        
-        url = "https://loginbp.ggpolarbear.com/MajorLogin"
-        headers = {
-            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "Content-Type": "application/octet-stream",
-            "Expect": "100-continue",
-            "X-Unity-Version": "2018.4.11f1",
-            "X-GA": "v1 1",
-            "ReleaseVersion": "OB54"
-        }
-        
-        response = requests.post(url, data=encrypted_payload, headers=headers, timeout=10, verify=False)
-        response.raise_for_status()
-
-        if response.status_code == 200:
-            # Parse response
-            data_dict = None
-            try:
-                example_msg = output_pb2.Garena_420()
-                example_msg.ParseFromString(response.content)
-                data_dict = {field.name: getattr(example_msg, field.name)
-                             for field in example_msg.DESCRIPTOR.fields
-                             if field.name not in ["binary", "binary_data", "Garena420"]}
-            except Exception as e:
-                try:
-                    data_dict = response.json()
-                except ValueError:
-                    return None
-
-            if data_dict and "token" in data_dict:
-                token_value = data_dict["token"]
-                try:
-                    decoded_token = jwt.decode(token_value, options={"verify_signature": False})
-                except Exception:
-                    decoded_token = {}
-
-                return {
-                    "account_id": decoded_token.get("account_id"),
-                    "account_name": decoded_token.get("nickname"),
-                    "open_id": open_id,
-                    "access_token": access_token,
-                    "platform": decoded_token.get("external_type"),
-                    "region": decoded_token.get("lock_region"),
-                    "status": "success",
-                    "token": token_value
-                }
-        
-        return None
-
-    except Exception:
-        return None
-
-# -----------------------------
-# Player Info Functions
-# -----------------------------
-def create_info_protobuf(uid):
-    message = uid_generator_pb2.uid_generator()
-    message.saturn_ = int(uid)
-    message.garena = 1
-    return message.SerializeToString()
-
-def get_player_info(target_uid, token, server_name=None):
-    """Get detailed player information"""
-    try:
-        if not server_name:
-            server_name = get_server_from_token(token)
+        if hasattr(client, 'CliEnts2') and client.CliEnts2 and hasattr(client, 'key') and client.key and hasattr(client, 'iv') and client.iv:
+            join_packet = JoinTeamCode(teamcode, client.key, client.iv)
+            client.CliEnts2.send(join_packet)
             
-        protobuf_data = create_info_protobuf(target_uid)
-        encrypted_data = encrypt_message_hex(protobuf_data)
-        endpoint = get_base_url(server_name) + "GetPlayerPersonalShow"
-
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB54"
-        }
-
-        response = requests.post(endpoint, data=bytes.fromhex(encrypted_data), headers=headers, verify=False)
-        
-        if response.status_code != 200:
-            return None
-
-        hex_response = response.content.hex()
-        binary = bytes.fromhex(hex_response)
-        
-        info = data_pb2.AccountPersonalShowInfo()
-        info.ParseFromString(binary)
-        
-        return info
-    except Exception as e:
-        print(f"Error getting player info: {e}")
-        return None
-
-def extract_player_info(info_data):
-    """Extract player information from protobuf response"""
-    if not info_data:
-        return None
-
-    basic_info = info_data.basic_info
-    return {
-        'uid': basic_info.account_id,
-        'nickname': basic_info.nickname,
-        'level': basic_info.level,
-        'region': basic_info.region,
-        'likes': basic_info.liked,
-        'release_version': basic_info.release_version
-    }
-
-# -----------------------------
-# Authentication Helper Functions
-# -----------------------------
-def decode_author_uid(token):
-    try:
-        decoded = jwt.decode(token, options={"verify_signature": False})
-        return decoded.get("account_id") or decoded.get("sub")
+            start_time = time.time()
+            response_received = False
+            idT = None
+            sq = None
+            
+            while time.time() - start_time < 8:
+                try:
+                    if hasattr(client, 'DaTa2') and client.DaTa2 and len(client.DaTa2.hex()) > 30:
+                        hex_data = client.DaTa2.hex()
+                        if '0500' in hex_data[0:4]:
+                            try:
+                                if "08" in hex_data:
+                                    decoded_data = DeCode_PackEt(f'08{hex_data.split("08", 1)[1]}')
+                                else:
+                                    decoded_data = DeCode_PackEt(hex_data[10:])
+                                
+                                dT = json.loads(decoded_data)
+                                
+                                if "5" in dT and "data" in dT["5"]:
+                                    team_data = dT["5"]["data"]
+                                    
+                                    if "31" in team_data and "data" in team_data["31"]:
+                                        sq = team_data["31"]["data"]
+                                        idT = team_data["1"]["data"]
+                                        response_received = True
+                                        break
+                            except:
+                                pass
+                    time.sleep(0.1)
+                except:
+                    time.sleep(0.1)
+            
+            if response_received and idT and sq:
+                for i in range(99):
+                    try:
+                        client.CliEnts2.send(JoinTeamCode(teamcode, client.key, client.iv))
+                        client.CliEnts2.send(GhostPakcet(idT, name, sq, client.key, client.iv))
+                        time.sleep(0.1)
+                        client.CliEnts2.send(ExitBot('000000', client.key, client.iv))
+                        client.CliEnts2.send(GhostPakcet(idT, name, sq, client.key, client.iv))
+                    except:
+                        break
+                success = True
     except:
-        return None
+        pass
+    return success
 
-# -----------------------------
-# Friend Management Functions - WITH RETRY
-# -----------------------------
-@retry_operation(max_retries=10, delay=1)
-def remove_friend_with_retry(author_uid, target_uid, token, server_name=None):
-    """Remove friend with retry mechanism"""
+def execute_ghost_command(client, teamcode, name, user_id, client_number, clients_list):
+    success = False
     try:
-        if not server_name:
-            server_name = get_server_from_token(token)
+        if hasattr(client, 'CliEnts2') and client.CliEnts2 and hasattr(client, 'key') and client.key and hasattr(client, 'iv') and client.iv:
+            join_packet = JoinTeamCode(teamcode, client.key, client.iv)
+            client.CliEnts2.send(join_packet)
             
-        # Get player info
-        player_info = get_player_info(target_uid, token, server_name)
-        
-        msg = RemoveFriend_Req_pb2.RemoveFriend()
-        msg.AuthorUid = int(author_uid)
-        msg.TargetUid = int(target_uid)
-        encrypted_bytes = encrypt_message(msg.SerializeToString())
-
-        url = get_base_url(server_name) + "RemoveFriend"
-        headers = {
-            'Authorization': f"Bearer {token}",
-            'User-Agent': "Dalvik/2.1.0 (Linux; Android 9)",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB54"
-        }
-
-        res = requests.post(url, data=encrypted_bytes, headers=headers, verify=False)
-        
-        # Extract player info
-        player_data = None
-        if player_info:
-            player_data = extract_player_info(player_info)
-        
-        # Check if successful
-        if res.status_code == 200:
-            status = "success"
-        else:
-            status = "failed"
-            raise Exception(f"HTTP {res.status_code}: {res.text}")
-        
-        response_data = {
-            "author_uid": author_uid,
-            "nickname": player_data.get('nickname') if player_data else "Unknown",
-            "uid": target_uid,
-            "level": player_data.get('level') if player_data else 0,
-            "likes": player_data.get('likes') if player_data else 0,
-            "region": player_data.get('region') if player_data else "Unknown",
-            "release_version": player_data.get('release_version') if player_data else "Unknown",
-            "status": status,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        return response_data
-
-    except Exception as e:
-        print(f"Remove friend error: {e}")
-        raise e
-
-@retry_operation(max_retries=10, delay=1)
-def send_friend_request_with_retry(author_uid, target_uid, token, server_name=None):
-    """Send friend request with retry mechanism"""
-    try:
-        if not server_name:
-            server_name = get_server_from_token(token)
+            start_time = time.time()
+            response_received = False
             
-        # Get player info
-        player_info = get_player_info(target_uid, token, server_name)
-        
-        encrypted_id = Encrypt_ID(target_uid)
-        payload = f"08a7c4839f1e10{encrypted_id}1801"
-        encrypted_payload = encrypt_api(payload)
+            while time.time() - start_time < 8:
+                try:
+                    if hasattr(client, 'DaTa2') and client.DaTa2 and len(client.DaTa2.hex()) > 30:
+                        hex_data = client.DaTa2.hex()
+                        if '0500' in hex_data[0:4]:
+                            try:
+                                if "08" in hex_data:
+                                    decoded_data = DeCode_PackEt(f'08{hex_data.split("08", 1)[1]}')
+                                else:
+                                    decoded_data = DeCode_PackEt(hex_data[10:])
+                                
+                                dT = json.loads(decoded_data)
+                                
+                                if "5" in dT and "data" in dT["5"]:
+                                    team_data = dT["5"]["data"]
+                                    
+                                    if "31" in team_data and "data" in team_data["31"]:
+                                        sq = team_data["31"]["data"]
+                                        idT = team_data["1"]["data"]
+                                        
+                                        client.CliEnts2.send(ExitBot('000000', client.key, client.iv))
+                                        time.sleep(0.2)
+                                        
+                                        ghost_packet = GhostPakcet(idT, name, sq, client.key, client.iv)
+                                        client.CliEnts2.send(ghost_packet)
+                                        
+                                        success = True
+                                        response_received = True
+                                        break
+                            except:
+                                pass
+                    time.sleep(0.1)
+                except:
+                    time.sleep(0.1)
+            
+            if not response_received:
+                try:
+                    ghost_packet_alt = GhostPakcet(teamcode, name, "1", client.key, client.iv)
+                    client.CliEnts2.send(ghost_packet_alt)
+                    time.sleep(0.5)
+                    success = True
+                except:
+                    pass
+    except:
+        pass
+    return success
 
-        url = get_base_url(server_name) + "RequestAddingFriend"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "X-Unity-Version": "2018.4.11f1",
-            "X-GA": "v1 1",
-            "ReleaseVersion": "OB54",
+
+class FF_CLient():
+
+    def __init__(self, id, password):
+        self.id = id
+        self.password = password
+        self.key = None
+        self.iv = None
+        self.Get_FiNal_ToKen_0115()     
+            
+    def Connect_SerVer_OnLine(self , Token , tok , host , port , key , iv , host2 , port2):
+            try:
+                self.AutH_ToKen_0115 = tok    
+                self.CliEnts2 = socket.create_connection((host2 , int(port2)))
+                self.CliEnts2.send(bytes.fromhex(self.AutH_ToKen_0115))                  
+            except:pass        
+            while True:
+                try:
+                    self.DaTa2 = self.CliEnts2.recv(99999)
+                    if '0500' in self.DaTa2.hex()[0:4] and len(self.DaTa2.hex()) > 30:	         	    	    
+                            self.packet = json.loads(DeCode_PackEt(f'08{self.DaTa2.hex().split("08", 1)[1]}'))
+                            self.AutH = self.packet['5']['data']['7']['data']
+                    
+                except:pass    	
+                                                            
+    def Connect_SerVer(self , Token , tok , host , port , key , iv , host2 , port2):
+            self.AutH_ToKen_0115 = tok    
+            self.CliEnts = socket.create_connection((host , int(port)))
+            self.CliEnts.send(bytes.fromhex(self.AutH_ToKen_0115))  
+            self.DaTa = self.CliEnts.recv(1024)          	        
+            threading.Thread(target=self.Connect_SerVer_OnLine, args=(Token , tok , host , port , key , iv , host2 , port2)).start()
+            self.Exemple = xMsGFixinG('12345678')
+            
+            self.key = key
+            self.iv = iv
+            
+            with connected_clients_lock:
+                connected_clients[self.id] = self
+            
+            while True:      
+                try:
+                    self.DaTa = self.CliEnts.recv(1024)   
+                    if len(self.DaTa) == 0 or (hasattr(self, 'DaTa2') and len(self.DaTa2) == 0):	            		
+                        try:            		    
+                            self.CliEnts.close()
+                            if hasattr(self, 'CliEnts2'):
+                                self.CliEnts2.close()
+                            self.Connect_SerVer(Token , tok , host , port , key , iv , host2 , port2)                    		                    
+                        except:
+                            try:
+                                self.CliEnts.close()
+                                if hasattr(self, 'CliEnts2'):
+                                    self.CliEnts2.close()
+                                self.Connect_SerVer(Token , tok , host , port , key , iv , host2 , port2)
+                            except:
+                                self.CliEnts.close()
+                                if hasattr(self, 'CliEnts2'):
+                                    self.CliEnts2.close()
+                                ResTarT_BoT()	            
+                           
+                    if '1200' in self.DaTa.hex()[0:4] and 900 > len(self.DaTa.hex()) > 100:
+                        if b"***" in self.DaTa:
+                            self.DaTa = self.DaTa.replace(b"***",b"106")         
+                        try:
+                           self.BesTo_data = json.loads(DeCode_PackEt(self.DaTa.hex()[10:]))	       
+                           self.input_msg = 'besto_love' if '8' in self.BesTo_data["5"]["data"] else self.BesTo_data["5"]["data"]["4"]["data"]
+                        except: 
+                            self.input_msg = None	   	 
+                        self.DeCode_CliEnt_Uid = self.BesTo_data["5"]["data"]["1"]["data"]
+                        self.CliEnt_Uid = EnC_Uid(self.DeCode_CliEnt_Uid , Tp = 'Uid')
+                               
+                    if 'Alli' in self.input_msg[:10]:
+                        self.CliEnts.send(GenResponsMsg(f'''
+[C][B][000000]━━━━━━━━━━━━ 
+
+[C][B][000000]━━━━━━━━━━━━''', 2 , self.DeCode_CliEnt_Uid , self.DeCode_CliEnt_Uid , key , iv))
+                        time.sleep(0.3)
+                        self.CliEnts.close()
+                        if hasattr(self, 'CliEnts2'):
+                            self.CliEnts2.close()
+                        self.Connect_SerVer(Token , tok , host , port , key , iv , host2 , port2)	                    	 	 
+                except Exception as e:
+                    try:
+                        self.CliEnts.close()
+                        if hasattr(self, 'CliEnts2'):
+                            self.CliEnts2.close()
+                    except:
+                        pass
+                    self.Connect_SerVer(Token , tok , host , port , key , iv , host2 , port2)
+                                    
+    def GeT_Key_Iv(self , serialized_data):
+        my_message = KEYS2.MyMessage()
+        my_message.ParseFromString(serialized_data)
+        timestamp , key , iv = my_message.field21 , my_message.field22 , my_message.field23
+        timestamp_obj = Timestamp()
+        timestamp_obj.FromNanoseconds(timestamp)
+        timestamp_seconds = timestamp_obj.seconds
+        timestamp_nanos = timestamp_obj.nanos
+        combined_timestamp = timestamp_seconds * 1_000_000_000 + timestamp_nanos
+        return combined_timestamp , key , iv    
+
+    def Guest_GeneRaTe(self , uid , password):
+        self.url = "https://100067.connect.garena.com/oauth/guest/token/grant"
+        self.headers = {
+            "Host": "100067.connect.garena.com",
+            "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)",
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Dalvik/2.1.0 (Linux; Android 9)"
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "close"
         }
-
-        r = requests.post(url, headers=headers, data=bytes.fromhex(encrypted_payload), verify=False)
-        
-        player_data = None
-        if player_info:
-            player_data = extract_player_info(player_info)
-        
-        if r.status_code == 200:
-            status = "success"
-        else:
-            status = "failed"
-            raise Exception(f"HTTP {r.status_code}: {r.text}")
-        
-        response_data = {
-            "author_uid": author_uid,
-            "nickname": player_data.get('nickname') if player_data else "Unknown",
-            "uid": target_uid,
-            "level": player_data.get('level') if player_data else 0,
-            "likes": player_data.get('likes') if player_data else 0,
-            "region": player_data.get('region') if player_data else "Unknown",
-            "release_version": player_data.get('release_version') if player_data else "Unknown",
-            "status": status,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.dataa = {
+            "uid": f"{uid}",
+            "password": f"{password}",
+            "response_type": "token",
+            "client_type": "2",
+            "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
+            "client_id": "100067"
         }
         
-        return response_data
+        try:
+            if not uid or not password:
+                print(f"❌ بيانات الحساب غير صالحة: {uid}")
+                time.sleep(5)
+                return self.Guest_GeneRaTe(uid, password)
+                
+            self.response = requests.post(self.url, headers=self.headers, data=self.dataa, timeout=30)
+            
+            if self.response.status_code != 200:
+                print(f"❌ خطأ في الاستجابة: {self.response.status_code}")
+                time.sleep(5)
+                return self.Guest_GeneRaTe(uid, password)
+                
+            response_data = self.response.json()
+            
+            if 'access_token' not in response_data or 'open_id' not in response_data:
+                print(f"❌ بيانات الاستجابة غير مكتملة: {response_data}")
+                time.sleep(5)
+                return self.Guest_GeneRaTe(uid, password)
+            
+            self.Access_ToKen = response_data['access_token']
+            self.Access_Uid = response_data['open_id']
+            
+            # ✅ طباعة Open ID و Access Token
+            print(f"\n✅ Open ID: {self.Access_Uid}")
+            print(f"✅ Access Token: {self.Access_ToKen[:30]}...")
+            
+            return self.ToKen_GeneRaTe(self.Access_ToKen , self.Access_Uid)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"❌ خطأ في الاتصال للحساب {uid}: {e}")
+            time.sleep(5)
+            return self.Guest_GeneRaTe(uid, password)
+        except Exception as e:
+            print(f"❌ خطأ غير متوقع للحساب {uid}: {e}")
+            time.sleep(2)
+            return self.Guest_GeneRaTe(uid, password)
+                                        
+    def GeT_LoGin_PorTs(self , JwT_ToKen , PayLoad):
+        self.UrL = 'https://clientbp.ggpolarbear.com/GetLoginData'
+        self.HeadErs = {
+            'Expect': '100-continue',
+            'Authorization': f'Bearer {JwT_ToKen}',
+            'X-Unity-Version': '2018.4.11f1',
+            'X-GA': 'v1 1',
+            'ReleaseVersion': 'OB54',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; G011A Build/PI)',
+            'Host': 'clientbp.ggwhitehawk.com',
+            'Connection': 'close',
+            'Accept-Encoding': 'gzip, deflate, br'
+        }       
+        try:
+            self.Res = requests.post(self.UrL, headers=self.HeadErs, data=PayLoad, verify=False, timeout=30)
+            
+            if self.Res.content:
+                hex_content = self.Res.content.hex()
+                try:
+                    self.BesTo_data = json.loads(DeCode_PackEt(hex_content))  
+                    address = self.BesTo_data['32']['data'] 
+                    address2 = self.BesTo_data['14']['data']
+                    
+                    ip = address[:len(address) - 6] 
+                    ip2 = address2[:len(address2) - 6]
+                    port = address[len(address) - 5:] 
+                    port2 = address2[len(address2) - 5:]             
+                    
+                    return ip , port , ip2 , port2
+                except Exception as e:
+                    print(f"❌ خطأ في معالجة بيانات البورت: {e}")
+                    return None, None, None, None
+            else:
+                print("❌ لا توجد بيانات في الاستجابة")
+                return None, None, None, None
+                
+        except requests.RequestException as e:
+            print(f"❌ خطأ في طلب البورتات: {e}")
+            return None, None, None, None
+        except Exception as e:
+            print(f"❌ خطأ غير متوقع في طلب البورتات: {e}")
+            return None, None, None, None
         
-    except Exception as e:
-        print(f"Add friend error: {e}")
-        raise e
-
-# -----------------------------
-# API Routes
-# -----------------------------
-@app.route('/remove_friend', methods=['GET'])
-def remove_friend_api():
-    token = request.args.get('token')
-    player_id = request.args.get('player_id')
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    server_name = request.args.get('server_name')
-
-    if not player_id:
-        return jsonify({"status": "failed", "message": "Missing 'player_id'"}), 400
-
-    if token:
-        author_uid = decode_author_uid(token)
-        if not author_uid:
-            return jsonify({"status": "failed", "message": "Invalid token"}), 400
-    elif uid and password:
-        print(f"Attempting to generate token for UID: {uid}")
-        token, error = get_token_from_uid_password(uid, password)
-        if error:
-            print(f"Token generation failed: {error}")
-            return jsonify({"status": "failed", "message": error}), 400
-        print(f"Token generated successfully")
-        author_uid = decode_author_uid(token)
-        if not author_uid:
-            return jsonify({"status": "failed", "message": "Generated token is invalid"}), 400
-    else:
-        return jsonify({"status": "failed", "message": "Either 'token' or 'uid' and 'password' must be provided"}), 400
-
-    result = remove_friend_with_retry(author_uid, player_id, token, server_name)
-    return jsonify(result)
-
-@app.route('/add_friend', methods=['GET'])
-def add_friend_api():
-    token = request.args.get('token')
-    player_id = request.args.get('player_id')
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    server_name = request.args.get('server_name')
-
-    if not player_id:
-        return jsonify({"status": "failed", "message": "Missing 'player_id'"}), 400
-
-    if token:
-        author_uid = decode_author_uid(token)
-        if not author_uid:
-            return jsonify({"status": "failed", "message": "Invalid token"}), 400
-    elif uid and password:
-        token, error = get_token_from_uid_password(uid, password)
-        if error:
-            return jsonify({"status": "failed", "message": error}), 400
-        author_uid = decode_author_uid(token)
-    else:
-        return jsonify({"status": "failed", "message": "Either 'token' or 'uid' and 'password' must be provided"}), 400
-
-    result = send_friend_request_with_retry(author_uid, player_id, token, server_name)
-    return jsonify(result)
-
-@app.route('/get_player_info', methods=['GET'])
-def get_player_info_api():
-    token = request.args.get('token')
-    player_id = request.args.get('player_id')
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    server_name = request.args.get('server_name')
-
-    if not player_id:
-        return jsonify({"status": "failed", "message": "Missing 'player_id'"}), 400
-
-    if not token and uid and password:
-        token, error = get_token_from_uid_password(uid, password)
-        if error:
-            return jsonify({"status": "failed", "message": error}), 400
-
-    if not token:
-        return jsonify({"status": "failed", "message": "Token required"}), 400
-
-    player_info = get_player_info(player_id, token, server_name)
-    if not player_info:
-        return jsonify({"status": "failed", "message": "Failed to get player info"}), 400
-
-    player_data = extract_player_info(player_info)
-    if not player_data:
-        return jsonify({"status": "failed", "message": "Failed to extract player info"}), 400
-
-    player_data.update({
-        "status": "success",
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
-    
-    return jsonify(player_data)
-
-@app.route('/token', methods=['GET'])
-def oauth_guest():
-    uid = request.args.get('uid')
-    password = request.args.get('password')
-    
-    if not uid or not password:
-        return jsonify({"message": "Missing uid or password"}), 400
-
-    token, error = get_token_from_uid_password(uid, password)
-    if error:
-        return jsonify({"message": error}), 400
+    def ToKen_GeneRaTe(self , Access_ToKen , Access_Uid):
+        self.UrL = "https://loginbp.ggpolarbear.com/MajorLogin"
+        self.HeadErs = {
+            'X-Unity-Version': '2018.4.11f1',
+            'ReleaseVersion': 'OB54',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-GA': 'v1 1',
+            'Content-Length': '928',
+            'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 7.1.2; ASUS_Z01QD Build/QKQ1.190825.002)',
+            'Host': 'loginbp.ggpolarbear.com',
+            'Connection': 'Keep-Alive',
+            'Accept-Encoding': 'gzip'   
+        }   
         
-    author_uid = decode_author_uid(token)
-    if not author_uid:
-        return jsonify({"message": "Generated token is invalid"}), 400
+        # ✅ بناء البايلود باستخدام Pb2 بدلاً من البايتس الثابتة
+        encrypted_payload, protobuf_raw = build_major_login_payload(Access_Uid, Access_ToKen)
+        self.PaYload = encrypted_payload
         
-    return jsonify({
-        "status": "success",
-        "token": token,
-        "uid": uid,
-        "author_uid": author_uid
-    })
+        # ✅ طباعة البايلود (موجودة في build_major_login_payload)
+        
+        try:
+            self.ResPonse = requests.post(self.UrL, headers=self.HeadErs, data=self.PaYload, verify=False, timeout=30)
+            
+            if self.ResPonse.status_code == 200 and len(self.ResPonse.text) > 10:
+                try:
+                    if self.ResPonse.content:
+                        hex_content = self.ResPonse.content.hex()
+                        self.BesTo_data = json.loads(DeCode_PackEt(hex_content))
+                        self.JwT_ToKen = self.BesTo_data['8']['data']           
+                        self.combined_timestamp , self.key , self.iv = self.GeT_Key_Iv(self.ResPonse.content)
+                        ip , port , ip2 , port2 = self.GeT_LoGin_PorTs(self.JwT_ToKen , self.PaYload)            
+                        return self.JwT_ToKen , self.key , self.iv, self.combined_timestamp , ip , port , ip2 , port2
+                    else:
+                        print("❌ لا توجد بيانات في استجابة التوكن")
+                        raise Exception("No data in token response")
+                except Exception as e:
+                    print(f"❌ خطأ في تحليل استجابة التوكن: {e}")
+                    time.sleep(2)
+                    return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
+            else:
+                print(f"❌ خطأ في استجابة التوكن، الحالة: {self.ResPonse.status_code}")
+                time.sleep(2)
+                return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
+                
+        except requests.RequestException as e:
+            print(f"❌ خطأ في طلب التوكن: {e}")
+            time.sleep(5)
+            return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
+        except Exception as e:
+            print(f"❌ خطأ غير متوقع في طلب التوكن: {e}")
+            time.sleep(2)
+            return self.ToKen_GeneRaTe(Access_ToKen, Access_Uid)
+      
+    def Get_FiNal_ToKen_0115(self):
+        try:
+            result = self.Guest_GeneRaTe(self.id , self.password)
+            if not result:
+                print("❌ فشل في الحصول على التوكنات، إعادة المحاولة...")
+                time.sleep(2)
+                return self.Get_FiNal_ToKen_0115()
+                
+            token , key , iv , Timestamp , ip , port , ip2 , port2 = result
+            
+            if not all([ip, port, ip2, port2]):
+                print("❌ فشل في الحصول على البورتات، إعادة المحاولة...")
+                time.sleep(2)
+                return self.Get_FiNal_ToKen_0115()
+                
+            self.JwT_ToKen = token        
+            try:
+                self.AfTer_DeC_JwT = jwt.decode(token, options={"verify_signature": False})
+                self.AccounT_Uid = self.AfTer_DeC_JwT.get('account_id')
+                self.EncoDed_AccounT = hex(self.AccounT_Uid)[2:]
+                self.HeX_VaLue = DecodE_HeX(Timestamp)
+                self.TimE_HEx = self.HeX_VaLue
+                self.JwT_ToKen_ = token.encode().hex()
+            except Exception as e:
+                print(f"❌ خطأ في فك التوكن: {e}")
+                time.sleep(2)
+                return self.Get_FiNal_ToKen_0115()
+                
+            try:
+                self.Header = hex(len(EnC_PacKeT(self.JwT_ToKen_, key, iv)) // 2)[2:]
+                length = len(self.EncoDed_AccounT)
+                self.__ = '00000000'
+                if length == 9: self.__ = '0000000'
+                elif length == 8: self.__ = '00000000'
+                elif length == 10: self.__ = '000000'
+                elif length == 7: self.__ = '000000000'
+                else:
+                    print('Unexpected length encountered')                
+                self.Header = f'0115{self.__}{self.EncoDed_AccounT}{self.TimE_HEx}00000{self.Header}'
+                self.FiNal_ToKen_0115 = self.Header + EnC_PacKeT(self.JwT_ToKen_ , key , iv)
+            except Exception as e:
+                print(f"❌ خطأ في التوكن النهائي: {e}")
+                time.sleep(5)
+                return self.Get_FiNal_ToKen_0115()
+                
+            self.AutH_ToKen = self.FiNal_ToKen_0115
+            self.Connect_SerVer(self.JwT_ToKen , self.AutH_ToKen , ip , port , key , iv , ip2 , port2)        
+            return self.AutH_ToKen , key , iv
+            
+        except Exception as e:
+            print(f"❌ خطأ في Get_FiNal_ToKen_0115: {e}")
+            time.sleep(10)
+            return self.Get_FiNal_ToKen_0115()
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({"status": "healthy", "service": "FreeFire-API"}), 200
+ACCOUNTS = []
 
-# -----------------------------
-# Startup Function
-# -----------------------------
-async def startup():
-    print(f"[🚀] Starting FreeFire API Service...")
-    print(f"[📦] Using Pb2 for payload generation")
-    print(f"[✅] Service ready")
-
-# -----------------------------
-# Run Server
-# -----------------------------
-if __name__ == '__main__':
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-    print(f"[🚀] Starting {__name__.upper()} on port {port} ...")
+def load_accounts_from_file(filename="accs.txt"):
+    accounts = []
     try:
-        asyncio.run(startup())
+        with open(filename, "r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    if ":" in line:
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            account_id = parts[0].strip()
+                            password = parts[1].strip()
+                            accounts.append({'id': account_id, 'password': password})
+                    else:
+                        accounts.append({'id': line.strip(), 'password': ''})
+        print(f"✅ تم تحميل {len(accounts)} حساب من {filename}")
+    except FileNotFoundError:
+        print(f"❌ ملف {filename} غير موجود!")
     except Exception as e:
-        print(f"[⚠️] Startup warning: {e} — continuing without full initialization")
-    app.run(host='0.0.0.0', port=port, debug=False)
+        print(f"❌ حدث خطأ أثناء قراءة الملف: {e}")
+    
+    return accounts
+
+ACCOUNTS = load_accounts_from_file()
+
+if not ACCOUNTS:
+    ACCOUNTS = [{'id': '4173444648', 'password': '6F0D6506AE64A0B02657DE5CFAFF3988E3D2A3EE28C2B83AF54591D925606140'}]
+
+def start_account(account):
+    try:
+        FF_CLient(account['id'], account['password'])
+    except Exception as e:
+        print(f"❌ Error starting account {account['id']}: {e}")
+        time.sleep(2)
+        start_account(account)
+
+def background_tasks():
+    while True:
+        try:
+            time.sleep(60 * 30)
+        except Exception as e:
+            time.sleep(60)
+
+@app.route('/api/ghost_attack', methods=['GET'])
+def api_ghost_attack():
+    try:
+        teamcode = request.args.get('teamcode')
+        name = request.args.get('name', 'MERO')
+        
+        if not teamcode:
+            return jsonify({
+                "success": False,
+                "message": "Teamcode is required"
+            }), 400
+        
+        if not ChEck_Commande(teamcode):
+            return jsonify({
+                "success": False,
+                "message": "Invalid teamcode format"
+            }), 400
+        
+        clients_list = get_random_accounts(3)
+        
+        if not clients_list:
+            return jsonify({
+                "success": False,
+                "message": "No connected accounts available"
+            }), 503
+            
+        success_count = 0
+        threads = []
+        results = []
+        
+        for i, client in enumerate(clients_list, 1):
+            thread = threading.Thread(target=lambda c=client, r=results: r.append(
+                execute_blrx_command(c, teamcode, name, "api_user", i)))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join(timeout=60)
+        
+        success_count = sum(results)
+        
+        return jsonify({
+            "success": True,
+            "message": f"Ghost attack completed successfully",
+            "teamcode": teamcode,
+            "name": name,
+            "accounts_used": len(clients_list),
+            "successful_attacks": success_count
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }), 500
+
+@app.route('/api/ghost', methods=['GET'])
+def api_ghost():
+    try:
+        teamcode = request.args.get('teamcode')
+        name = request.args.get('name', 'MERO')
+        
+        if not teamcode:
+            return jsonify({
+                "success": False,
+                "message": "Teamcode is required"
+            }), 400
+        
+        if not ChEck_Commande(teamcode):
+            return jsonify({
+                "success": False,
+                "message": "Invalid teamcode format"
+            }), 400
+        
+        clients_list = get_random_accounts(3)
+        
+        if not clients_list:
+            return jsonify({
+                "success": False,
+                "message": "No connected accounts available"
+            }), 503
+            
+        success_count = 0
+        threads = []
+        results = []
+        
+        for i, client in enumerate(clients_list, 1):
+            thread = threading.Thread(target=lambda c=client, r=results: r.append(
+                execute_ghost_command(c, teamcode, name, "api_user", i, clients_list)))
+            threads.append(thread)
+            thread.start()
+        
+        for thread in threads:
+            thread.join(timeout=60)
+        
+        success_count = sum(results)
+        
+        return jsonify({
+            "success": True,
+            "message": f"Ghost successfully",
+            "teamcode": teamcode,
+            "name": name,
+            "accounts_used": len(clients_list),
+            "successful_attacks": success_count
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }), 500
+
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    try:
+        with connected_clients_lock:
+            accounts_count = len(connected_clients)
+            accounts_list = list(connected_clients.keys())
+        
+        return jsonify({
+            "status": "online",
+            "connected_accounts": accounts_count,
+            "active_accounts": accounts_list[:10],
+            "total_accounts_loaded": len(ACCOUNTS)
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+def start_accounts():
+    print("⏳ جاري بدء تشغيل الحسابات...")
+
+    if not ACCOUNTS:
+        print("❌ لا توجد حسابات لبدء التشغيل!")
+        return
+    
+    accounts_to_start = ACCOUNTS[:99999999999]
+    print(f"🔧 سيتم تشغيل {len(accounts_to_start)} حساب من أصل {len(ACCOUNTS)}")
+    
+    for i, account in enumerate(accounts_to_start, 1):
+        try:
+            print(f"🚀 بدء الحساب {i}: {account['id']}")
+            threading.Thread(target=start_account, args=(account,), daemon=True).start()
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"❌ خطأ في بدء الحساب {account['id']}: {e}")
+
+def StarT_SerVer():
+    start_accounts()
+
+    threading.Thread(target=background_tasks, daemon=True).start()
+    threading.Thread(target=AuTo_ResTartinG, daemon=True).start()
+    
+    print(f"✅ تم بدء تشغيل النظام بالكامل بنجاح")
+    print(f"🕒 وقت البدء: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📊 عدد الحسابات المحملة: {len(ACCOUNTS)}")
+    print(f"🔧 عدد الحسابات المشغلة: {min(5, len(ACCOUNTS))}")
+    print(f"🌐 API Server running on http://127.0.0.1:5000")
+    
+    app.run(host='0.0.0.0', port=8080, debug=False)
+
+if __name__ == "__main__":
+    StarT_SerVer()
