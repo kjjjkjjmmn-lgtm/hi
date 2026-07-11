@@ -806,14 +806,17 @@ def StarT_SerVer():
 
     threading.Thread(target=background_tasks, daemon=True).start()
     threading.Thread(target=AuTo_ResTartinG, daemon=True).start()
-    
-    print(f"✅ تم بدء تشغيل النظام بالكامل بنجاح")
+
+    PORT = int(os.environ.get("PORT", 5000))
+
+    print("✅ تم بدء تشغيل النظام بالكامل بنجاح")
     print(f"🕒 وقت البدء: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"📊 عدد الحسابات المحملة: {len(ACCOUNTS)}")
+    print(f"📊 عدد الحسابات المحلة: {len(ACCOUNTS)}")
     print(f"🔧 عدد الحسابات المشغلة: {min(5, len(ACCOUNTS))}")
-    print(f"🌐 API Server running on http://127.0.0.1:5000")
-    
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    print(f"🌐 API Server running on http://0.0.0.0:{PORT}")
+
+    app.run(host="0.0.0.0", port=PORT, debug=False)
+
 
 if __name__ == "__main__":
     StarT_SerVer()
